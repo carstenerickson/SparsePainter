@@ -179,8 +179,8 @@ public:
 
 /////////////////////beginning of pbwt contents///////////////////////////
 
-template<typename Tidx>
-void free_PBWT_memory(vector<vector<uint8_t>> &panel, Tidx** &prefix, int** &divergence, Tidx** &u, Tidx** &v, Tidx** &w) {
+template<typename Tidx, typename Tpos>
+void free_PBWT_memory(vector<vector<uint8_t>> &panel, Tidx** &prefix, Tpos** &divergence, Tidx** &u, Tidx** &v, Tidx** &w) {
   // First, delete the inner arrays of prefix, divergence, u, and v
   // Note: Since temp1, temp2, temp3, and temp4 are continuous blocks of memory
   // you only need to delete their base pointers (the pointers originally returned by 'new').
@@ -252,8 +252,8 @@ void reversePBWT(vector<vector<int>> &recon,
     #endif
 }
 
-template<typename Tidx>
-void PBWT(vector<vector<uint8_t>> &panel, Tidx **prefix, int **divergence,
+template<typename Tidx, typename Tpos>
+void PBWT(vector<vector<uint8_t>> &panel, Tidx **prefix, Tpos **divergence,
           Tidx **u, Tidx **v, Tidx **w, int num, int N){
   for (int i = 0; i<num; ++i){
     prefix[i][0] = i;
@@ -916,11 +916,11 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> multialleleLongMatchpbwt(
  } 
 */
 
-template<typename Tidx>
+template<typename Tidx, typename Tpos>
 tuple<vector<int>,vector<int>,vector<int>,vector<int>> longMatchpbwt(const int L_initial,
                                                                      vector<vector<uint8_t>> &panel,
                                                                      Tidx **prefix,
-                                                                     int **divergence,
+                                                                     Tpos **divergence,
                                                                      Tidx **u,
                                                                      Tidx **v,
                                                                      Tidx **w,
@@ -1238,12 +1238,12 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> longMatchpbwt(const int L
               }
             }
             if (f!=g) {
-              while (divergence[f][k+1] <= k+1 - L){
+              while ((int)divergence[f][k+1] <= k+1 - L){
                 --f;
                 //store divergence
                 dZ[prefix[f][k+1]] = k+1-L;
               }
-              while (g<M-qM && divergence[g][k+1] <= k+1-L){
+              while (g<M-qM && (int)divergence[g][k+1] <= k+1-L){
                 //store divergence
                 dZ[prefix[g][k+1]] = k+1-L;
                 ++g;
@@ -1400,19 +1400,19 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> longMatchpbwt(const int L
 // Allocate the PBWT index arrays with element type Tidx (chosen by do_pbwt from
 // the panel size), build the PBWT, find matches, and free. Factored out of
 // do_pbwt so the index width can be selected at runtime via Tidx.
-template<typename Tidx>
+template<typename Tidx, typename Tpos>
 tuple<vector<int>,vector<int>,vector<int>,vector<int>> pbwt_build_and_match(
         vector<vector<uint8_t>> &panel, int &L_initial, vector<double> &gd,
         vector<int> &queryidx, int ncores, const int M, const int N, const int qM,
         int minmatch, int L_minmatch, const bool samefile, const bool phase,
         const string &targetfile){
   Tidx **prefix = new Tidx*[M-qM];
-  int  **divergence = new int*[M-qM];
+  Tpos **divergence = new Tpos*[M-qM];
   Tidx **u = new Tidx*[M-qM];
   Tidx **v = new Tidx*[M-qM];
   Tidx **w = new Tidx*[M-qM];
   Tidx *temp1 = new Tidx[(long long)(M-qM)*(N+1)];
-  int  *temp2 = new int [(long long)(M-qM)*(N+1)];
+  Tpos *temp2 = new Tpos[(long long)(M-qM)*(N+1)];
   Tidx *temp3 = new Tidx[(long long)(M-qM)*(N)];
   Tidx *temp4 = new Tidx[(long long)(M-qM)*(N)];
   Tidx *temp5 = new Tidx[(long long)(M-qM)*(N)];
@@ -1494,17 +1494,26 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> do_pbwt(int& L_initial,
   }*/
   #endif
 
-  // Narrow the PBWT index/count arrays (prefix/u/v/w hold values in [0, M-qM])
-  // to 16-bit when the panel has < 65536 haplotypes (the common case), which
-  // halves their footprint; fall back to 32-bit for larger panels. divergence
-  // holds SNP positions and stays 32-bit (also dodges a signedness trap in the
-  // match comparisons against k+1-L).
-  if ((M - qM) < 65536)
-    return pbwt_build_and_match<uint16_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,
-                                          minmatch,L_minmatch,samefile,phase,targetfile);
+  // Narrow the PBWT arrays to 16-bit where the values fit, halving their
+  // footprint. prefix/u/v/w hold values in [0, M-qM]; divergence holds SNP
+  // positions in [0, N]. Each width is chosen independently at runtime, with a
+  // 32-bit fallback for large panels / long chromosomes. The match comparisons
+  // against k+1-L cast divergence to int so a 32-bit (unsigned) divergence does
+  // not turn a negative right-hand side into a huge value.
+  const bool idx16 = (M - qM) < 65536;
+  const bool pos16 = N < 65536;
+  if (idx16 && pos16)
+    return pbwt_build_and_match<uint16_t,uint16_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,
+                                                   minmatch,L_minmatch,samefile,phase,targetfile);
+  else if (idx16)
+    return pbwt_build_and_match<uint16_t,uint32_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,
+                                                   minmatch,L_minmatch,samefile,phase,targetfile);
+  else if (pos16)
+    return pbwt_build_and_match<uint32_t,uint16_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,
+                                                   minmatch,L_minmatch,samefile,phase,targetfile);
   else
-    return pbwt_build_and_match<uint32_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,
-                                          minmatch,L_minmatch,samefile,phase,targetfile);
+    return pbwt_build_and_match<uint32_t,uint32_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,
+                                                   minmatch,L_minmatch,samefile,phase,targetfile);
 
 }
 
