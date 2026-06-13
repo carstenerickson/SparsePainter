@@ -180,7 +180,7 @@ public:
 /////////////////////beginning of pbwt contents///////////////////////////
 
 template<typename Tidx>
-void free_PBWT_memory(vector<vector<int>> &panel, Tidx** &prefix, int** &divergence, Tidx** &u, Tidx** &v, Tidx** &w) {
+void free_PBWT_memory(vector<vector<uint8_t>> &panel, Tidx** &prefix, int** &divergence, Tidx** &u, Tidx** &v, Tidx** &w) {
   // First, delete the inner arrays of prefix, divergence, u, and v
   // Note: Since temp1, temp2, temp3, and temp4 are continuous blocks of memory
   // you only need to delete their base pointers (the pointers originally returned by 'new').
@@ -199,7 +199,7 @@ void free_PBWT_memory(vector<vector<int>> &panel, Tidx** &prefix, int** &diverge
 
   // Clear the panel vector and minimize its memory usage
   panel.clear();
-  vector<vector<int>>().swap(panel); // This technique is used to shrink the vector's capacity to fit its size.
+  vector<vector<uint8_t>>().swap(panel); // This technique is used to shrink the vector's capacity to fit its size.
 
   // Nullify the pointers to ensure that they don't dangle.
   prefix = nullptr;
@@ -253,7 +253,7 @@ void reversePBWT(vector<vector<int>> &recon,
 }
 
 template<typename Tidx>
-void PBWT(vector<vector<int>> &panel, Tidx **prefix, int **divergence,
+void PBWT(vector<vector<uint8_t>> &panel, Tidx **prefix, int **divergence,
           Tidx **u, Tidx **v, Tidx **w, int num, int N){
   for (int i = 0; i<num; ++i){
     prefix[i][0] = i;
@@ -350,7 +350,7 @@ void PBWT(vector<vector<int>> &panel, Tidx **prefix, int **divergence,
 
 void ReadVCF(const string inFile,
              const string qinFile,
-             vector<vector<int>> &panel,
+             vector<vector<uint8_t>> &panel,
              const int N,
              const int M,
              const int qM,
@@ -509,7 +509,7 @@ void ReadVCF(const string inFile,
 }
 
 void Readphase_donor(const string inFile,
-                     vector<vector<int>> &panel,
+                     vector<vector<uint8_t>> &panel,
                      const int N,
                      const int M,
                      const int qM) {
@@ -552,7 +552,7 @@ void Readphase_donor(const string inFile,
 
     int Oid = i;
     // add snps to the panel
-    panel.push_back(vector<int>());
+    panel.push_back(vector<uint8_t>());
     panel[i].resize(N);
 
     for (int k = 0; k<N; ++k){ // for every SNP
@@ -918,7 +918,7 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> multialleleLongMatchpbwt(
 
 template<typename Tidx>
 tuple<vector<int>,vector<int>,vector<int>,vector<int>> longMatchpbwt(const int L_initial,
-                                                                     vector<vector<int>> &panel,
+                                                                     vector<vector<uint8_t>> &panel,
                                                                      Tidx **prefix,
                                                                      int **divergence,
                                                                      Tidx **u,
@@ -1402,7 +1402,7 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> longMatchpbwt(const int L
 // do_pbwt so the index width can be selected at runtime via Tidx.
 template<typename Tidx>
 tuple<vector<int>,vector<int>,vector<int>,vector<int>> pbwt_build_and_match(
-        vector<vector<int>> &panel, int &L_initial, vector<double> &gd,
+        vector<vector<uint8_t>> &panel, int &L_initial, vector<double> &gd,
         vector<int> &queryidx, int ncores, const int M, const int N, const int qM,
         int minmatch, int L_minmatch, const bool samefile, const bool phase,
         const string &targetfile){
@@ -1465,10 +1465,10 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> do_pbwt(int& L_initial,
     nrow_panel=M;
     samefile=false;
   }
-  vector<vector<int>> panel;
+  vector<vector<uint8_t>> panel;
 
   if (!phase) {
-    panel = vector<vector<int>>(nrow_panel, vector<int>(N));
+    panel = vector<vector<uint8_t>>(nrow_panel, vector<uint8_t>(N));
     ReadVCF(reffile,targetfile,panel,N,M,qM,haploid);
   }else{
     Readphase_donor(reffile,panel,N,M,qM);
