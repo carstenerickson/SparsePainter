@@ -1831,7 +1831,7 @@ pair<hMat, vector<double>> forwardProb(const hMat& mat,
     logmultF.push_back(log(sumfp)+logmultF[j-1]);
     hVecScale(forward_prob.m[j],1.0/sumfp);
   }
-  return(make_pair(forward_prob, logmultF));
+  return {std::move(forward_prob), std::move(logmultF)};
 }
 
 pair<hMat, vector<double>> backwardProb(const hMat& mat,
@@ -1863,7 +1863,7 @@ pair<hMat, vector<double>> backwardProb(const hMat& mat,
     hVecScale(backward_prob.m[j],1.0/sumBjp1);
     backward_prob.m[j].setdefault(otherprobuse);
   }
-  return(make_pair(backward_prob, logmultB));
+  return {std::move(backward_prob), std::move(logmultB)};
 }
 
 
@@ -2105,12 +2105,12 @@ double est_lambda_EM(hMat& mat,
     otherprob=cal_otherprob(nref,sameprob);
 
     pair<hMat, vector<double>> f=forwardProb(mat,sameprob,otherprob);
-    hMat forward_prob=f.first;
-    vector<double> logmultF=f.second;
+    hMat& forward_prob=f.first;
+    const vector<double>& logmultF=f.second;
 
     pair<hMat, vector<double>> b=backwardProb(mat,sameprob,otherprob);
-    hMat backward_prob=b.first;
-    vector<double> logmultB=b.second;
+    hMat& backward_prob=b.first;
+    const vector<double>& logmultB=b.second;
     vector<double> u((nsnp-1),0);
     for(int j=0;j<nsnp-1;++j){
       double al = exp(logmultF[j+1]+logmultB[j+1]-logmultF[nsnp-1]);
@@ -2269,7 +2269,7 @@ double est_lambda_EM_average(const hAnc& refidx,
       }
 
       pair<hMat,vector<int>> matall=matchfiletohMat(matchdata,nref-npop,nsnp,gd);
-      hMat mat=matall.first;
+      hMat& mat=matall.first;
       int nsnp_use=nsnp;
       if(nsnp>minsnpEM){
         if(nsnp*EMsnpfrac<minsnpEM){
@@ -2374,11 +2374,11 @@ vector<double> chunklength_each(vector<double>& gd,
     gl[j]=gd[j+1]-gd[j];
   }
 
-  hMat forward_prob=forwardprob.first;
-  vector<double> logmultF=forwardprob.second;
+  hMat& forward_prob=forwardprob.first;
+  const vector<double>& logmultF=forwardprob.second;
 
-  hMat backward_prob=backwardprob.first;
-  vector<double> logmultB=backwardprob.second;
+  hMat& backward_prob=backwardprob.first;
+  const vector<double>& logmultB=backwardprob.second;
 
   vector<double> suml(npop,0.0);
 
@@ -2427,11 +2427,11 @@ vector<double> chunkcount_each(hMat& mat,
   //calculate chunk length for each haplotype
   int nsnp=mat.d2;
 
-  hMat forward_prob=forwardprob.first;
-  vector<double> logmultF=forwardprob.second;
+  hMat& forward_prob=forwardprob.first;
+  const vector<double>& logmultF=forwardprob.second;
 
-  hMat backward_prob=backwardprob.first;
-  vector<double> logmultB=backwardprob.second;
+  hMat& backward_prob=backwardprob.first;
+  const vector<double>& logmultB=backwardprob.second;
 
   vector<double> sumc(npop,0.0);
 
@@ -2472,7 +2472,7 @@ vector<vector<int>> sample_each(pair<hMat, vector<double>>& forwardprob,
                                 const vector<double>& otherprob,
                                 const int nsample){
 
-  hMat forward_prob=forwardprob.first;
+  hMat& forward_prob=forwardprob.first;
 
   int nsnp=forward_prob.d2;
 
@@ -3142,12 +3142,20 @@ void paintall(const string method,
   while(nhap_left>0){
     nsamples_use = (ncores*2*LDAfactor < nhap_left) ? ncores*2*LDAfactor : nhap_left; //ensure both copies are included
 
-    vector<vector<vector<double>>> painting_all(nsamples_use,
+    // painting_all is only touched when run!="chunk" (and freed at the end of
+    // that block via swap); skip the nsamples_use*npop*nsnp doubles in pure
+    // chunk mode.
+    vector<vector<vector<double>>> painting_all;
+    if(run!="chunk") painting_all = vector<vector<vector<double>>>(nsamples_use,
                                                 vector<vector<double>>(npop, vector<double>(nsnp)));
 
     vector<vector<double>> chunklength(nsamples_use, vector<double>(npop));
     vector<vector<double>> chunkcount(nsamples_use, vector<double>(npop));
-    vector<vector<vector<int>>> samplestate(nsamples_use, vector<vector<int>>(nsample, vector<int>(nsnp)));
+    // samplestate is only populated/read on the csample path (default off);
+    // allocating it otherwise wastes nsamples_use*nsample*nsnp ints (hundreds
+    // of MB at whole-chromosome SNP counts).
+    vector<vector<vector<int>>> samplestate;
+    if(csample) samplestate = vector<vector<vector<int>>>(nsamples_use, vector<vector<int>>(nsample, vector<int>(nsnp)));
 
 
     // get the matches before the loop
@@ -3295,7 +3303,7 @@ void paintall(const string method,
       }
 
       pair<hMat,vector<int>> matall=matchfiletohMat(targetmatchdata,nref,nsnp,gd);
-      hMat mat=matall.first;
+      hMat& mat=matall.first;
       nmatch_use[ii - (nhap_use - nhap_left)]=matall.second;
 
       if(diff_lambda){
