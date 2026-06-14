@@ -31,20 +31,27 @@
 using namespace std;
 using namespace arma;
 
-class hVec { // A sparse vector format
+// A sparse vector. Keys live in `k` (insertion order, unique) with values in a
+// parallel `vals` vector. This replaces the previous unordered_map backing: the
+// map cost was a per-key node malloc on every build (forwardProb/backwardProb
+// rebuild one of these per SNP per haplotype). getall/setall serve the
+// cross-key-set lookups through a reused thread-local dense scratch (scatter the
+// keys' positions, gather, reset) - O(|k|+|idx|), no hashing, and crucially the
+// output order matches the query order so FP sums are bit-identical to the map.
+// Insertion order in `k` is preserved (hVecSum over the default keys, and the
+// marginal normalisation that depends on it, must see the same summation order).
+class hVec {
 public:
-  vector<int> k; // the keys that are in the vector
-  unordered_map<int, double> v; // the values, stored as a map from keys to values
-  int len; // nominal length of the vector; currently unused
-  double x0; // default value for entries
+  vector<int> k;       // keys present (insertion order, unique)
+  vector<double> vals; // values, parallel to k
+  int len;             // nominal length (= nref for painting columns); bounds the scratch
+  double x0;           // default value for absent entries
   hVec(){
-    // Create an empty vector
     len=0;
     x0=0;
   };
   hVec(int len,
        double x0){
-    // Create a vector of length len filled with x0
     this->len=len;
     this->x0=x0;
   };
@@ -52,63 +59,77 @@ public:
        vector<double> val,
        int len,
        double x0){
-    // Create a vector of length len filled with x0 except at idx which contains val
     this->len=len;
     this->x0=x0;
-    for(int i=0;i<idx.size();++i){
-      k.push_back(idx[i]);
-      v[idx[i]]=val[i];
-    }
+    setall(idx,val); // upsert (dedup, last value wins) to match the old map-backed ctor
   };
   void setdefault(double x0){
-    // Change the default value
     this->x0=x0;
   };
-  void setnocheck(int p,
-                  double val){
-    // Set a value, should be known to be in the keys
-    v[p]=val;
+  // Append a key the caller already knows is absent - the build-hot primitive.
+  void push(int p,
+            double val){
+    k.push_back(p);
+    vals.push_back(val);
+  };
+  // Linear membership/lookup. Only reached off the painting hot path (e.g. LDA,
+  // the occasional single get); the hot path uses push/getall/setall instead.
+  int findpos(int p) const {
+    for(size_t i=0;i<k.size();++i) if(k[i]==p) return (int)i;
+    return -1;
+  };
+  bool in(int p){
+    return findpos(p)>=0;
+  };
+  double get(int p){
+    int i=findpos(p);
+    return (i>=0) ? vals[i] : x0;
   };
   void set(int p,
            double val){
-    //Safely set a value
-    if(!in(p)) k.push_back(p);
-    setnocheck(p,val);
+    int i=findpos(p);
+    if(i>=0){ vals[i]=val; } else { push(p,val); }
   };
-  void setall(vector<int> p,
-              vector<double> val){
-    for(int i=0; i<p.size();++i){
-      if(!in(p[i])) k.push_back(p[i]);
-      setnocheck(p[i],val[i]);
+  void setnocheck(int p,
+                  double val){
+    set(p,val);
+  };
+  // Upsert a batch (dedup, last value wins), O(|k|+|p|) via a reused dense scratch.
+  void setall(const vector<int>& p,
+              const vector<double>& val){
+    static thread_local vector<int> pos; // key -> index in k, else -1
+    int n=len;
+    for(int kk : k) if(kk>=n) n=kk+1;
+    for(int pp : p) if(pp>=n) n=pp+1;
+    if((int)pos.size()<n) pos.resize(n,-1);
+    for(size_t i=0;i<k.size();++i) pos[k[i]]=(int)i;
+    for(size_t i=0;i<p.size();++i){
+      int q=pos[p[i]];
+      if(q>=0){ vals[q]=val[i]; }
+      else { pos[p[i]]=(int)k.size(); k.push_back(p[i]); vals.push_back(val[i]); }
     }
-  }
-  bool in(int p){
-    // Check if a value has a non-default entry
-    if(v.find(p)==v.end()) return(false);
-    return(true);
+    for(int kk : k) pos[kk]=-1; // reset everything touched (original + appended)
   };
-  double get(int p){
-    // Get a value from the vector: either its set value or the default if not present
-    if(!in(p)){
-      return(x0);
-    }else{
-      return(v[p]);
-    }
-  };
-
+  // Gather values at idx, in idx order, defaulting to x0 for absent keys.
   vector<double> getall(const vector<int>& idx){
-    // Get values from the vector: either its set value or the default if not present
-
     vector<double> values(idx.size());
-    for(int i=0;i<idx.size();++i){
-      if(!in(idx[i])) {
-        values[i]=x0;
-      } else {
-        values[i]=v[idx[i]];
-      }
+    if(k.empty()){
+      for(size_t i=0;i<idx.size();++i) values[i]=x0;
+      return values;
     }
-    return(values);
-  }
+    static thread_local vector<int> pos; // key -> index in k, else -1
+    int n=len;
+    for(int kk : k) if(kk>=n) n=kk+1;
+    for(int id : idx) if(id>=n) n=id+1;
+    if((int)pos.size()<n) pos.resize(n,-1);
+    for(size_t i=0;i<k.size();++i) pos[k[i]]=(int)i;
+    for(size_t i=0;i<idx.size();++i){
+      int q=pos[idx[i]];
+      values[i]=(q>=0) ? vals[q] : x0;
+    }
+    for(size_t i=0;i<k.size();++i) pos[k[i]]=-1;
+    return values;
+  };
 
 };
 
@@ -1725,10 +1746,10 @@ void update_vec(vector<double>& a,
 }
 
 double hVecSum(hVec& v,
-               vector<int> idx={}){
-  // calculate the sum of the values of a hVec with given indices
+               const vector<int>& idx={}){
+  // sum the values; an empty idx means "all of v's own keys", i.e. sum of vals
   if (idx.empty()) {
-    idx = v.k;
+    return(vec_sum(v.vals));
   }
   return(vec_sum(v.getall(idx)));
 }
@@ -1748,22 +1769,17 @@ hVec hVecCirc(hVec& v1, hVec& v2){
 
 void hVecScale(hVec& v,
                const double x){
-  //Scale a hash vector by x
-  vector<int> idx=v.k;
-  vector<double> val=v.getall(idx);
-  v.setdefault(x*v.x0);
-  vector<double> xvec(idx.size(),x);
-  v.setall(idx,vec_multiply(val,xvec));
+  //Scale a sparse vector by x, in place over the parallel values
+  for(size_t i=0;i<v.vals.size();++i) v.vals[i]*=x;
+  v.x0*=x;
 }
 
 
 vector<double> hVecdense(hVec& x,
                          const int nrow){
-  //Convert a hash vector x into a dense vector with length nrow
+  //Convert a sparse vector x into a dense vector with length nrow
   vector<double> vdense(nrow, x.x0);
-  vector<int> k=x.k;
-  vector<double> vval=x.getall(k);
-  update_vec(vdense,k,vval);
+  for(size_t i=0;i<x.k.size();++i) vdense[x.k[i]]=x.vals[i];
   return(vdense);
 }
 
@@ -1850,7 +1866,7 @@ pair<hMat, vector<double>> forwardProb(const hMat& mat,
 
     fprev=forward_prob.m[j-1].getall(twj);
     for(int i=0;i<twj.size();++i){
-      forward_prob.m[j].set(twj[i],sameprobuse*fprev[i]+otherprobuse);
+      forward_prob.m[j].push(twj[i],sameprobuse*fprev[i]+otherprobuse);
     }
 
     sumfp=hVecSum(forward_prob.m[j],twj);
@@ -1883,7 +1899,7 @@ pair<hMat, vector<double>> backwardProb(const hMat& mat,
     vector<double> val(twj.size());
     for(int i=0;i<twj.size();++i){
       val[i]=sameprobuse*Bjp1[i]+otherprobuse*sumBjp1;
-      backward_prob.m[j].set(twj[i],val[i]);
+      backward_prob.m[j].push(twj[i],val[i]);
     }
     logmultB[j]=log(vec_sum(val)+otherprobuse*sumBjp1*(nrow-twj.size()))+logmultB[j+1];
     hVecScale(backward_prob.m[j],1.0/sumBjp1);
@@ -1923,7 +1939,29 @@ pair<hMat,vector<int>> matchfiletohMat(const vector<vector<int>>& matchdata,
   for(int i = 0; i < matchdata.size(); ++i) {
     int val = matchdata[i][0];
     for(int j = matchdata[i][1]; j <= matchdata[i][2]; ++j) {
-      mat.m[j].set(val, 1.0);
+      mat.m[j].push(val, 1.0);
+    }
+  }
+  // The old map-backed set() de-duplicated donors within a column (a donor can
+  // appear in two kept matches after the adaptive-L retry); push() does not, so
+  // compact each column to first-occurrence keys (all values are 1.0). A
+  // monotonic stamp keeps the dense `seen` scratch valid across columns and
+  // across the many per-haplotype calls without an O(nref) reset each time.
+  {
+    static thread_local vector<long long> seen; // donor -> stamp when last kept
+    static thread_local long long stamp = 0;
+    if((int)seen.size() < nref) seen.resize(nref, -1);
+    for(int j = 0; j < nsnp; ++j){
+      vector<int>& kk = mat.m[j].k;
+      if(kk.size() <= 1) continue;
+      vector<double>& vv = mat.m[j].vals;
+      ++stamp;
+      size_t w = 0;
+      for(size_t t = 0; t < kk.size(); ++t){
+        int d = kk[t];
+        if(seen[d] != stamp){ seen[d] = stamp; kk[w] = kk[t]; vv[w] = vv[t]; ++w; }
+      }
+      if(w != kk.size()){ kk.resize(w); vv.resize(w); }
     }
   }
 
@@ -2372,12 +2410,12 @@ hMat indpainting(const hMat& mat,
       popidx=refindex[refnumberidx];
       // update the probability of this population
 
-      popprob[popidx] += marginal_prob.m[j].get(refnumberidx);
+      popprob[popidx] += marginal_prob.m[j].vals[k];
     }
 
     double probsum=vec_sum(popprob);
     for(int i=0; i<npop; ++i){
-      marginal_prob_pop.m[j].set(i,round(popprob[i]/probsum* precision)/precision);
+      marginal_prob_pop.m[j].push(i,round(popprob[i]/probsum* precision)/precision);
     }
 
 
