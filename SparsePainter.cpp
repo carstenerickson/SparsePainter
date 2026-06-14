@@ -39,6 +39,12 @@ using namespace arma;
 // signatures while it is experimental.
 static int g_windowsize = 0;
 
+// Optional fixed RNG seed (-seed N; 0 = nondeterministic, the default). The
+// match tie-break (getorder) and a few sampling steps seed from random_device,
+// so two runs differ slightly. -seed makes a run reproducible, and lets a code
+// change be checked bit-for-bit against the original by seeding both builds.
+static unsigned int g_seed = 0;
+
 // A sparse vector. Keys live in `k` (insertion order, unique) with values in a
 // parallel `vals` vector. This replaces the previous unordered_map backing: the
 // map cost was a per-key node malloc on every build (forwardProb/backwardProb
@@ -619,7 +625,7 @@ vector<int> getorder(const vector<double>& vec) {
   }
 
   random_device rd;
-  mt19937 g(rd());
+  mt19937 g(g_seed ? g_seed : rd());
   for (auto& group : groups) {
     shuffle(group.second.begin(), group.second.end(), g);
   }
@@ -1912,7 +1918,7 @@ vector<int> randomsample(const vector<int>& popidx,
   if(number>popidx.size()) cout<<"Number cannot be greater than the size of popidx. Please check the populations' indices are continuous integers start from 0, as provided by the popfile."<<endl;
   // Initialize the random number generator
   random_device rd;
-  mt19937 gen(rd());
+  mt19937 gen(g_seed ? g_seed : rd());
 
   // Shuffle the elements of the vector randomly
   vector<int> shuffled_popidx = popidx;
@@ -2651,7 +2657,7 @@ vector<vector<int>> sample_each(pair<hMat, vector<double>>& forwardprob,
   vector<vector<int>> sample_state(nsample,vector<int>(nsnp));
 
   random_device rd;
-  mt19937 gen(rd());
+  mt19937 gen(g_seed ? g_seed : rd());
   uniform_real_distribution<double> dis(0.0, 1.0);
   double random_value;
   double temp_sum=0;
@@ -2852,6 +2858,7 @@ void doAAS(vector<double>& pd,
            const string AASfile) {
 
   default_random_engine generator;
+  if(g_seed) generator.seed(g_seed);
   normal_distribution<double> distribution(0.0, 1e-6);
 
   int nsnp = pd.size();
@@ -4521,7 +4528,7 @@ int main(int argc, char *argv[]){
        param=="targetfile" || param=="mapfile"|| param=="rmsethre"||
        param=="popfile" || param=="namefile"|| param=="SNPfile"||
        param=="matchfile" || param=="out" || param=="probstore" ||
-       param=="window" || param=="windowsize" || param=="ncores" || param=="dp" || param=="nsample"){
+       param=="window" || param=="windowsize" || param=="ncores" || param=="dp" || param=="nsample" || param=="seed"){
       if(i==argc-1){
         cerr << "Error: Parameters should be given following -"<<param<<"."<<endl;
         cerr<<"Type -h or -help to see the help file."<<endl;
@@ -4626,6 +4633,8 @@ int main(int argc, char *argv[]){
       max_ite = stoi(argv[++i]);
     } else if (param == "ncores") {
       ncores = stoi(argv[++i]);
+    } else if (param == "seed") {
+      g_seed = (unsigned int)stoul(argv[++i]);
     } else {
       cerr << "Error: Unknown argument: " << param << ".\n";
       cerr<<"Type -h or -help to see the help file."<<endl;
