@@ -1492,13 +1492,22 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> windowed_build_and_match(
   const int nrow = (int)panel.size();
   const int core = (wsize/2 > 1) ? wsize/2 : 1; // SNPs each window owns
   const int ctx  = (wsize/4 > 1) ? wsize/4 : 1; // context columns each side of the core
-  int nwin = 0; for(int cs=0; cs<N; cs+=core) ++nwin;
+  vector<int> starts;
+  for(int cs=0; cs<N; cs+=core) starts.push_back(cs);
+  const int nwin = (int)starts.size();
   cout << "Windowed match-finding: " << nwin << " windows (core " << core
-       << ", context " << ctx << ", width<=" << core+2*ctx << ") over " << N << " SNPs" << endl;
-  vector<vector<int>> q_donor(nq), q_start(nq), q_end(nq);
-  for(int cs = 0; cs < N; cs += core){
-    int core_start = cs;
-    int core_end   = (cs+core < N) ? cs+core : N;      // [core_start, core_end)
+       << ", context " << ctx << ", width<=" << core+2*ctx << ") over " << N
+       << " SNPs, up to " << ncores << " windows in parallel" << endl;
+  // Per-window, per-query clipped matches. Windows are INDEPENDENT, so we run
+  // them in parallel (each builds a small serial PBWT) - this fills all cores
+  // even when only a couple of query haplotypes are being painted, where the
+  // inner per-query parallelism would leave most cores idle.
+  vector<vector<vector<int>>> wd(nwin), ws(nwin), we(nwin);
+  for(int wi=0; wi<nwin; ++wi){ wd[wi].resize(nq); ws[wi].resize(nq); we[wi].resize(nq); }
+#pragma omp parallel for num_threads(ncores) schedule(dynamic)
+  for(int wi=0; wi<nwin; ++wi){
+    int core_start = starts[wi];
+    int core_end   = (core_start+core < N) ? core_start+core : N; // [core_start, core_end)
     int w_start    = (core_start-ctx > 0) ? core_start-ctx : 0;
     int w_end      = (core_end+ctx < N) ? core_end+ctx : N;
     int W          = w_end - w_start;
@@ -1510,7 +1519,9 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> windowed_build_and_match(
     }
     vector<double> sub_gd(gd.begin()+w_start, gd.begin()+w_end);
     int Lw = L_initial;
-    auto win = pbwt_build_and_match<Tidx,Tpos>(sub, Lw, sub_gd, queryidx, ncores,
+    // ncores=1: the window loop already owns the parallelism, so the inner
+    // match-finding runs serially (no nested-OpenMP oversubscription).
+    auto win = pbwt_build_and_match<Tidx,Tpos>(sub, Lw, sub_gd, queryidx, 1,
                                                M, W, qM, minmatch, L_minmatch,
                                                samefile, phase, targetfile);
     const vector<int>& qall = get<0>(win);
@@ -1522,16 +1533,20 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> windowed_build_and_match(
         int gs = st[m] + w_start, ge = en[m] + w_start;
         int a = (gs > core_start) ? gs : core_start;
         int b = (ge < core_end-1) ? ge : core_end-1;
-        if(a <= b){ q_donor[qi].push_back(don[m]); q_start[qi].push_back(a); q_end[qi].push_back(b); }
+        if(a <= b){ wd[wi][qi].push_back(don[m]); ws[wi][qi].push_back(a); we[wi][qi].push_back(b); }
       }
     }
   }
+  omp_set_num_threads(ncores); // restore: the per-window calls set the thread count to 1
+  // Merge per query in window order into the CSR layout do_pbwt/get_matchdata expect.
   vector<int> queryidall(1,0), donorid, startpos, endpos;
   for(int qi=0; qi<nq; ++qi){
-    donorid.insert(donorid.end(), q_donor[qi].begin(), q_donor[qi].end());
-    startpos.insert(startpos.end(), q_start[qi].begin(), q_start[qi].end());
-    endpos.insert(endpos.end(), q_end[qi].begin(), q_end[qi].end());
-    queryidall.push_back(queryidall.back() + (int)q_donor[qi].size());
+    for(int wi=0; wi<nwin; ++wi){
+      donorid.insert(donorid.end(), wd[wi][qi].begin(), wd[wi][qi].end());
+      startpos.insert(startpos.end(), ws[wi][qi].begin(), ws[wi][qi].end());
+      endpos.insert(endpos.end(), we[wi][qi].begin(), we[wi][qi].end());
+    }
+    queryidall.push_back((int)donorid.size());
   }
   return make_tuple(queryidall, donorid, startpos, endpos);
 }
@@ -2085,19 +2100,19 @@ pair<hMat,vector<int>> matchfiletohMat(const vector<vector<int>>& matchdata,
     }
     if(left<0){
       vector<int> twj=mat.m[right].k;
-      mat.m[nomatch[i]].setall(twj,vector<double>(1.0,twj.size()));
+      mat.m[nomatch[i]].setall(twj,vector<double>(twj.size(),1.0));
     }else if(right>nsnp-1){
       vector<int> twj=mat.m[left].k;
-      mat.m[nomatch[i]].setall(twj,vector<double>(1.0,twj.size()));
+      mat.m[nomatch[i]].setall(twj,vector<double>(twj.size(),1.0));
     }else{
       double gd_left=gd_this-gd[left];
       double gd_right=gd[right]-gd_this;
       if(gd_left>gd_right){
         vector<int> twj=mat.m[right].k;
-        mat.m[nomatch[i]].setall(twj,vector<double>(1.0,twj.size()));
+        mat.m[nomatch[i]].setall(twj,vector<double>(twj.size(),1.0));
       }else{
         vector<int> twj=mat.m[left].k;
-        mat.m[nomatch[i]].setall(twj,vector<double>(1.0,twj.size()));
+        mat.m[nomatch[i]].setall(twj,vector<double>(twj.size(),1.0));
       }
     }
   }
@@ -3061,6 +3076,11 @@ void paintall(const string method,
 
   // estimate lambda
 
+  if(g_windowsize>0 && fixlambda==0){
+    cout<<"WARNING: -windowsize clips matches to window cores, which fragments long "
+          "matches and biases lambda estimation upward (each fragment reads as an extra "
+          "recombination). Strongly recommend -fixlambda <value> when windowing."<<endl;
+  }
   if(!diff_lambda){
     if(fixlambda!=0){
       lambda=fixlambda;
