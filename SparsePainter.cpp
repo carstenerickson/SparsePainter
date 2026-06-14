@@ -31,6 +31,14 @@
 using namespace std;
 using namespace arma;
 
+// Opt-in windowed match-finding (-windowsize W, 0 = off/full chromosome). When
+// set, the PBWT match-finding runs over overlapping SNP windows of W columns so
+// its arrays are O(nref*W) instead of O(nref*nsnp); painting stays
+// full-chromosome. Approximate (boundary effects bounded by the W/4 context),
+// not bit-identical. A file-scope flag keeps it out of the do_pbwt/paintall
+// signatures while it is experimental.
+static int g_windowsize = 0;
+
 // A sparse vector. Keys live in `k` (insertion order, unique) with values in a
 // parallel `vals` vector. This replaces the previous unordered_map backing: the
 // map cost was a per-key node malloc on every build (forwardProb/backwardProb
@@ -1463,6 +1471,71 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> pbwt_build_and_match(
   return matchresults;
 }
 
+// Windowed match-finding. Slide overlapping SNP windows: each window owns a core
+// of `wsize/2` SNPs and carries `wsize/4` context columns on each side. Per
+// window we column-slice the panel, build a small O(nref*W) PBWT, find matches
+// inside it, translate them to global SNP coordinates, and keep each clipped to
+// the window's core (the region this window owns). Matches accumulate per query
+// into the same CSR layout the full path returns, so painting is unchanged. For
+// a core SNP with context on both sides the donor set matches the full run;
+// boundary error is bounded by the context width (approximate, not bit-
+// identical). Requires the query haplotypes to live in the panel rows (samefile,
+// or non-phase input) - longMatchpbwt's separate phase-file reader assumes the
+// full chromosome and is rejected by do_pbwt before reaching here.
+template<typename Tidx, typename Tpos>
+tuple<vector<int>,vector<int>,vector<int>,vector<int>> windowed_build_and_match(
+        vector<vector<uint8_t>> &panel, int &L_initial, vector<double> &gd,
+        vector<int> &queryidx, int ncores, const int M, const int N, const int qM,
+        int minmatch, int L_minmatch, const bool samefile, const bool phase,
+        const string &targetfile, int wsize){
+  const int nq = (int)queryidx.size();
+  const int nrow = (int)panel.size();
+  const int core = (wsize/2 > 1) ? wsize/2 : 1; // SNPs each window owns
+  const int ctx  = (wsize/4 > 1) ? wsize/4 : 1; // context columns each side of the core
+  int nwin = 0; for(int cs=0; cs<N; cs+=core) ++nwin;
+  cout << "Windowed match-finding: " << nwin << " windows (core " << core
+       << ", context " << ctx << ", width<=" << core+2*ctx << ") over " << N << " SNPs" << endl;
+  vector<vector<int>> q_donor(nq), q_start(nq), q_end(nq);
+  for(int cs = 0; cs < N; cs += core){
+    int core_start = cs;
+    int core_end   = (cs+core < N) ? cs+core : N;      // [core_start, core_end)
+    int w_start    = (core_start-ctx > 0) ? core_start-ctx : 0;
+    int w_end      = (core_end+ctx < N) ? core_end+ctx : N;
+    int W          = w_end - w_start;
+    vector<vector<uint8_t>> sub(nrow, vector<uint8_t>(W));
+    for(int r=0;r<nrow;++r){
+      const vector<uint8_t>& src = panel[r];
+      vector<uint8_t>& dst = sub[r];
+      for(int c=0;c<W;++c) dst[c] = src[w_start + c];
+    }
+    vector<double> sub_gd(gd.begin()+w_start, gd.begin()+w_end);
+    int Lw = L_initial;
+    auto win = pbwt_build_and_match<Tidx,Tpos>(sub, Lw, sub_gd, queryidx, ncores,
+                                               M, W, qM, minmatch, L_minmatch,
+                                               samefile, phase, targetfile);
+    const vector<int>& qall = get<0>(win);
+    const vector<int>& don  = get<1>(win);
+    const vector<int>& st   = get<2>(win);
+    const vector<int>& en   = get<3>(win);
+    for(int qi=0; qi<nq; ++qi){
+      for(int m=qall[qi]; m<qall[qi+1]; ++m){
+        int gs = st[m] + w_start, ge = en[m] + w_start;
+        int a = (gs > core_start) ? gs : core_start;
+        int b = (ge < core_end-1) ? ge : core_end-1;
+        if(a <= b){ q_donor[qi].push_back(don[m]); q_start[qi].push_back(a); q_end[qi].push_back(b); }
+      }
+    }
+  }
+  vector<int> queryidall(1,0), donorid, startpos, endpos;
+  for(int qi=0; qi<nq; ++qi){
+    donorid.insert(donorid.end(), q_donor[qi].begin(), q_donor[qi].end());
+    startpos.insert(startpos.end(), q_start[qi].begin(), q_start[qi].end());
+    endpos.insert(endpos.end(), q_end[qi].begin(), q_end[qi].end());
+    queryidall.push_back(queryidall.back() + (int)q_donor[qi].size());
+  }
+  return make_tuple(queryidall, donorid, startpos, endpos);
+}
+
 tuple<vector<int>,vector<int>,vector<int>,vector<int>> do_pbwt(int& L_initial,
                                                                vector<double> gd,
                                                                vector<int>& queryidx,
@@ -1523,6 +1596,26 @@ tuple<vector<int>,vector<int>,vector<int>,vector<int>> do_pbwt(int& L_initial,
   // not turn a negative right-hand side into a huge value.
   const bool idx16 = (M - qM) < 65536;
   const bool pos16 = N < 65536;
+  // Windowed path (opt-in, -windowsize). Needs the query haplotypes in the panel
+  // rows; a separate phase target file is read full-chromosome by longMatchpbwt,
+  // so windowing is disabled there. The window's divergence holds positions in
+  // [0, window-width), so its position type is sized from the window, not N.
+  if (g_windowsize > 0) {
+    if (samefile || !phase) {
+      const bool pos16w = g_windowsize < 65536;
+      if (idx16 && pos16w)
+        return windowed_build_and_match<uint16_t,uint16_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,minmatch,L_minmatch,samefile,phase,targetfile,g_windowsize);
+      else if (idx16)
+        return windowed_build_and_match<uint16_t,uint32_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,minmatch,L_minmatch,samefile,phase,targetfile,g_windowsize);
+      else if (pos16w)
+        return windowed_build_and_match<uint32_t,uint16_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,minmatch,L_minmatch,samefile,phase,targetfile,g_windowsize);
+      else
+        return windowed_build_and_match<uint32_t,uint32_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,minmatch,L_minmatch,samefile,phase,targetfile,g_windowsize);
+    } else {
+      cout << "WARNING: -windowsize needs the query haplotypes in the panel "
+              "(reffile==targetfile, or VCF input); disabling windowing for this run." << endl;
+    }
+  }
   if (idx16 && pos16)
     return pbwt_build_and_match<uint16_t,uint16_t>(panel,L_initial,gd,queryidx,ncores,M,N,qM,
                                                    minmatch,L_minmatch,samefile,phase,targetfile);
@@ -4408,7 +4501,7 @@ int main(int argc, char *argv[]){
        param=="targetfile" || param=="mapfile"|| param=="rmsethre"||
        param=="popfile" || param=="namefile"|| param=="SNPfile"||
        param=="matchfile" || param=="out" || param=="probstore" ||
-       param=="window" || param=="ncores" || param=="dp" || param=="nsample"){
+       param=="window" || param=="windowsize" || param=="ncores" || param=="dp" || param=="nsample"){
       if(i==argc-1){
         cerr << "Error: Parameters should be given following -"<<param<<"."<<endl;
         cerr<<"Type -h or -help to see the help file."<<endl;
@@ -4497,6 +4590,8 @@ int main(int argc, char *argv[]){
       probstore = argv[++i];
     } else if (param == "window") {
       window = stod(argv[++i]);
+    } else if (param == "windowsize") {
+      g_windowsize = stoi(argv[++i]);
     } else if (param == "dp") {
       dp = stoi(argv[++i]);
     } else if (param == "nsample") {
